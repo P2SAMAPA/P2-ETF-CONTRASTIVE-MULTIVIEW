@@ -17,29 +17,40 @@ def load_master_data():
     return df
 
 def prepare_etf_macro_matrix(df, universe_tickers):
+    """
+    Returns DataFrame with ETF log returns + macro levels.
+    Index is datetime. Macro columns are those in config.MACRO_COLUMNS that exist.
+    """
+    # ETF log returns
     returns = pd.DataFrame(index=df.index)
     for ticker in universe_tickers:
         if ticker in df.columns:
             price = df[ticker]
             if not price.isna().all():
                 returns[ticker] = np.log(price / price.shift(1))
-    macro = df[config.MACRO_COLUMNS].copy() if all(c in df.columns for c in config.MACRO_COLUMNS) else pd.DataFrame()
+    # Macro columns that actually exist
+    avail_macro = [c for c in config.MACRO_COLUMNS if c in df.columns]
+    macro = df[avail_macro].copy() if avail_macro else pd.DataFrame(index=df.index)
     combined = pd.concat([returns, macro], axis=1).dropna()
     return combined
 
 def compute_shape_features(returns_df, window=20):
-    """Rolling statistical shapes for each ETF."""
+    """
+    Compute rolling statistical shapes for each ETF.
+    Returns DataFrame with same index as returns_df (initial rows will be NaN).
+    Columns: ETF_mean, ETF_std, ETF_skew, ETF_kurt, ETF_q25, ETF_q75.
+    """
+    etfs = [c for c in returns_df.columns if c not in config.MACRO_COLUMNS]
     shape_list = []
-    for col in returns_df.columns:
-        if col in config.MACRO_COLUMNS:
-            continue
-        roll = returns_df[col].rolling(window)
+    for col in etfs:
+        roll = returns_df[col].rolling(window, min_periods=window)
         mean = roll.mean()
         std = roll.std()
         skew = roll.skew()
         kurt = roll.kurt()
         q25 = roll.quantile(0.25)
         q75 = roll.quantile(0.75)
+        # Give names to avoid conflicts across ETFs
         shape = pd.DataFrame({
             f"{col}_mean": mean,
             f"{col}_std": std,
@@ -49,28 +60,38 @@ def compute_shape_features(returns_df, window=20):
             f"{col}_q75": q75
         })
         shape_list.append(shape)
-    shapes = pd.concat(shape_list, axis=1).dropna()
+    shapes = pd.concat(shape_list, axis=1)
     return shapes
 
 def compute_graph_features(returns_df, lookback=20, top_k=5):
     """
     For each day and each ETF, compute its average correlation with top k correlated ETFs.
-    Returns DataFrame with columns: ticker_corr1, ticker_corr2, ..., ticker_corrk.
+    Returns DataFrame with same index as returns_df (initial rows NaN).
+    Columns: ETF_corr1, ETF_corr2, ..., ETF_corrk.
     """
     etfs = [c for c in returns_df.columns if c not in config.MACRO_COLUMNS]
     n = len(returns_df)
-    graph_features = []
-    for i in range(lookback, n):
+    features = []
+    dates = returns_df.index
+    for i in range(n):
+        if i < lookback:
+            # Not enough data, fill with NaN
+            row = [np.nan] * (len(etfs) * top_k)
+            features.append(row)
+            continue
         window = returns_df.iloc[i-lookback:i]
-        corr = window.corr().values
-        # For each ETF, get top k correlations (excluding self)
+        corr = window[etfs].corr().values
         row = []
         for j, etf in enumerate(etfs):
             corr_row = corr[j]
-            # sort descending, skip self (index j)
-            top_indices = np.argsort(corr_row)[::-1][1:top_k+1] if top_k<len(etfs)-1 else np.argsort(corr_row)[::-1][1:]
+            # get indices of top k correlations (excluding self)
+            sorted_indices = np.argsort(corr_row)[::-1]
+            top_indices = [idx for idx in sorted_indices if idx != j][:top_k]
             top_vals = corr_row[top_indices]
+            if len(top_vals) < top_k:
+                top_vals = np.pad(top_vals, (0, top_k - len(top_vals)), constant_values=np.nan)
             row.extend(top_vals)
-        graph_features.append(row)
-    return pd.DataFrame(graph_features, index=returns_df.index[lookback:], 
-                        columns=[f"{etf}_corr_{k+1}" for etf in etfs for k in range(top_k)])
+        features.append(row)
+    cols = [f"{etf}_corr_{k+1}" for etf in etfs for k in range(top_k)]
+    graph_df = pd.DataFrame(features, index=dates, columns=cols)
+    return graph_df
