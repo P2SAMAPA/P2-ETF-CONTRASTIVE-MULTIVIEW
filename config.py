@@ -20,7 +20,8 @@ UNIVERSES = {
     ]
 }
 
-MACRO_COLUMNS = ["VIX", "DXY", "US10Y", "US2Y", "CRB", "GOLD"]
+# Real macro column names in the dataset
+MACRO_COLUMNS = ["VIX", "DXY", "T10Y2Y", "TBILL_3M", "IG_SPREAD", "HY_SPREAD"]
 
 # Rolling window for training (days)
 ROLLING_WINDOW = 252
