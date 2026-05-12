@@ -1,5 +1,5 @@
 """
-Daily training: build per‑ETF feature vectors (returns+macro, graph, shape), 
+Daily training: build per‑ETF feature vectors (returns+macro, graph, shape),
 train Barlow Twins, compute embeddings, rank by cosine similarity to target.
 """
 import pandas as pd
@@ -13,30 +13,41 @@ import config
 import data_manager
 from contrastive_models import train_bt_model
 
-def build_etf_feature_matrix(returns_etf, macro_df, shape_features, graph_features, lookback=20):
+def build_etf_feature_matrix(returns_etf, macro_df, shape_df, graph_df, lookback=20):
     """
     For each ETF, concatenate:
-    - recent returns (lookback days)
-    - macro levels at the last day
-    - recent shape features (last `lookback` days) -> average or flatten? We'll take the vector of shape features at the last day.
+    - recent returns (last 'lookback' days)
+    - macro levels at the last day (if macro exists)
+    - shape features at the last day
+    - graph features at the last day
+    All inputs are DataFrames with aligned indices.
     """
+    # Get last valid common index
+    common_idx = returns_etf.index[-1]  # last day (must be present)
+    # For shape and graph, take the most recent non-NaN value (they may be NaN at the start)
+    last_shape = shape_df.loc[common_idx] if common_idx in shape_df.index else shape_df.iloc[-1]
+    last_graph = graph_df.loc[common_idx] if common_idx in graph_df.index else graph_df.iloc[-1]
+
     etf_names = returns_etf.columns.tolist()
     feature_list = []
     for etf in etf_names:
         # recent returns (last `lookback` days)
         ret_series = returns_etf[etf].iloc[-lookback:].values
         # macro at last day
-        macro_last = macro_df.iloc[-1].values
-        # shape features for this ETF at last day
-        shape_cols = [c for c in shape_features.columns if c.startswith(etf)]
+        if not macro_df.empty:
+            macro_last = macro_df.loc[common_idx].values
+        else:
+            macro_last = np.array([])
+        # shape features for this ETF (filter columns starting with f"{etf}_")
+        shape_cols = [c for c in shape_df.columns if c.startswith(etf + "_")]
         if shape_cols:
-            shape_last = shape_features[shape_cols].iloc[-1].values
+            shape_last = last_shape[shape_cols].values
         else:
             shape_last = np.array([])
-        # graph features for this ETF at last day
-        graph_cols = [c for c in graph_features.columns if c.startswith(etf)]
+        # graph features for this ETF
+        graph_cols = [c for c in graph_df.columns if c.startswith(etf + "_")]
         if graph_cols:
-            graph_last = graph_features[graph_cols].iloc[-1].values
+            graph_last = last_graph[graph_cols].values
         else:
             graph_last = np.array([])
         # concatenate all
@@ -75,67 +86,64 @@ def main():
 
         # Take last ROLLING_WINDOW days
         train_df = full_data.iloc[-config.ROLLING_WINDOW:]
-        
+
         # Separate ETF returns and macro
         etf_cols = [c for c in train_df.columns if c not in config.MACRO_COLUMNS]
         returns_etf = train_df[etf_cols]
-        macro_df = train_df[config.MACRO_COLUMNS]
-        
-        # 2. Compute shape features (on the whole training window)
-        shape_features = data_manager.compute_shape_features(returns_etf, window=config.LOOKBACK_DAYS)
-        # Align index
-        shape_features = shape_features.loc[train_df.index]
-        
-        # 3. Compute graph features (on the whole training window)
-        graph_features = data_manager.compute_graph_features(returns_etf, lookback=config.LOOKBACK_DAYS, top_k=5)
-        # Align index (graph_features already aligned)
-        
+        macro_df = train_df[config.MACRO_COLUMNS] if all(c in train_df.columns for c in config.MACRO_COLUMNS) else pd.DataFrame()
+
+        # 2. Compute shape features (on the entire training window)
+        shape_df = data_manager.compute_shape_features(returns_etf, window=config.LOOKBACK_DAYS)
+        # shape_df already aligned with returns_etf index (full length, may have leading NaN)
+
+        # 3. Compute graph features (on the entire training window)
+        graph_df = data_manager.compute_graph_features(returns_etf, lookback=config.LOOKBACK_DAYS, top_k=5)
+        # graph_df also aligned
+
         # 4. Build per‑ETF feature matrix for the last day (using only the last `LOOKBACK_DAYS` of returns, but latest shapes/graph)
-        X_etf, etf_names = build_etf_feature_matrix(returns_etf, macro_df, shape_features, graph_features, lookback=config.LOOKBACK_DAYS)
+        X_etf, etf_names = build_etf_feature_matrix(
+            returns_etf, macro_df, shape_df, graph_df, lookback=config.LOOKBACK_DAYS
+        )
         print(f"  Feature dimension per ETF: {X_etf.shape[1]}")
-        
+
         # 5. Train Barlow Twins on these ETF feature vectors (across all ETFs in this universe)
         model, scaler = train_bt_model(
-            X_etf, X_etf.shape[1], 
-            hidden_dims=[128, 128],  # we can make configurable
+            X_etf, X_etf.shape[1],
+            hidden_dims=[128, 128],
             proj_dim=config.EMBEDDING_DIM,
             epochs=config.BT_EPOCHS,
             batch_size=config.BT_BATCH_SIZE,
             lr=config.BT_LEARNING_RATE,
             lambda_param=config.BT_LAMBDA
         )
-        
+
         # 6. Get embeddings for all ETFs (the same X_etf)
         X_scaled = scaler.transform(X_etf)
         with torch.no_grad():
             embeddings = model.get_embedding(torch.tensor(X_scaled, dtype=torch.float32))
-        
+
         # 7. Compute target embedding: average of top-performing ETFs in the training window.
-        # We need next‑day returns for each ETF at the end of the training window.
-        # Use the last day's next‑day return (i.e., day after last day) – actually we must compute within the training window.
-        # Simpler: For each ETF, compute its average daily return over the last 20 days of training (as a proxy for performance).
-        # Or use the next‑day return after the last day? But we only have up to last day.
-        # We'll use the last day's return? Not robust. Instead, use the mean return over the last 20 days.
+        # Use mean return over the last LOOKBACK_DAYS as proxy for performance.
         recent_returns = returns_etf.iloc[-config.LOOKBACK_DAYS:].mean().values
         target_emb = get_target_embedding(embeddings, etf_names, recent_returns, percentile=config.TOP_TARGET_PERCENTILE)
-        
+
         # 8. Rank ETFs by cosine similarity to target embedding
         sims = cosine_similarity(embeddings, target_emb.reshape(1, -1)).flatten()
         sorted_idx = np.argsort(sims)[::-1]
         top_etfs = [{"ticker": etf_names[i], "similarity": float(sims[i])} for i in sorted_idx[:config.TOP_N]]
-        
+
         print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "run_date": today
         }
-    
+
     # Save results
     Path("results").mkdir(exist_ok=True)
     local_path = Path(f"results/contrastive_{today}.json")
     with open(local_path, "w") as f:
         json.dump({"run_date": today, "universes": all_results}, f, indent=2)
-    
+
     import push_results
     push_results.push_daily_result(local_path)
     print("\n=== Multi‑View Contrastive Engine complete (full per‑ETF) ===")
